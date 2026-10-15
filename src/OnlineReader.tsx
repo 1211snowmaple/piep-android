@@ -1,0 +1,513 @@
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import DOMPurify from "dompurify";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { ProviderMark } from "./ProviderMark";
+import { WorkThumbnail } from "./WorkThumbnail";
+import { AuthorAvatar } from "./WorkCard";
+import { getOfflineAsset, getOfflineOutline, getOfflinePage, getPcAsset, getPcMetadata, getPcOutline, getPcPage, getPcWorkCollections, pcErrorMessage, saveOfflineWork, type PcCollection, type PcMetadata, type PcOutlineEntry, type PcPage, type PcWork } from "./pcApi";
+
+function readingKey(work: PcWork, editHash: string | null): string {
+  return `piep.android.pc.${work.id}.${work.currentVersion}.${work.contentHash ?? ""}.${editHash ?? "original"}`;
+}
+
+function legacyReadingKeys(work: PcWork, editHash: string | null): string[] {
+  // 古いキーには編集版の識別子がない。元本文と確認できるときだけ引き継ぐ。
+  if (editHash !== null) return [];
+  const keys = [`piep.android.pc.${work.id}.${work.currentVersion}.${work.contentHash ?? ""}`];
+  // 最初期の ID だけのキーには版情報がない。更新済み作品には流用しない。
+  if (work.currentVersion === 1) keys.push(`piep.android.pc.${work.id}`);
+  return keys;
+}
+
+function savedPage(work: PcWork, editHash: string | null): number {
+  try {
+    const key = `${readingKey(work, editHash)}.page`;
+    for (const candidate of [readingKey(work, editHash), ...legacyReadingKeys(work, editHash)]) {
+      const raw = window.localStorage.getItem(`${candidate}.page`);
+      if (raw === null) continue;
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value) || value < 0 || value > 1_000_000) continue;
+      if (`${candidate}.page` !== key) window.localStorage.setItem(key, String(value));
+      return value;
+    }
+    return 0;
+  } catch { return 0; }
+}
+
+type SavedPosition = { page: number; top: number; ratio: number; fontSize: number; lineHeight: number; fontFamily: "serif" | "sans" };
+
+function readSavedPosition(work: PcWork, editHash: string | null): SavedPosition | null {
+  try {
+    const key = `${readingKey(work, editHash)}.position`;
+    for (const candidate of [readingKey(work, editHash), ...legacyReadingKeys(work, editHash)]) {
+      const raw = window.localStorage.getItem(`${candidate}.position`);
+      if (raw === null) continue;
+      let value: Partial<SavedPosition> | null;
+      try { value = JSON.parse(raw) as Partial<SavedPosition> | null; } catch { continue; }
+      if (!value || !Number.isSafeInteger(value.page) || !Number.isFinite(value.top) || !Number.isFinite(value.ratio)) continue;
+      if (value.page! < 0 || value.top! < 0 || value.ratio! < 0 || value.ratio! > 1) continue;
+      if (`${candidate}.position` !== key) window.localStorage.setItem(key, raw);
+      return value as SavedPosition;
+    }
+    return null;
+  } catch { return null; }
+}
+
+function sameRevision(metadata: PcMetadata, work: PcWork, editHash: string | null): boolean {
+  return metadata.work.currentVersion === work.currentVersion
+    && metadata.work.contentHash === work.contentHash
+    && metadata.activeEditHash === editHash;
+}
+
+function safeHtml(source: string): string {
+  return DOMPurify.sanitize(source, {
+    ALLOWED_TAGS: ["p", "br", "h1", "h2", "h3", "ruby", "rt", "rp", "span", "strong", "em", "b", "i", "u", "s", "blockquote", "figure", "figcaption", "img", "hr", "a", "div", "ul", "ol", "li", "code", "pre"],
+    ALLOWED_ATTR: ["class", "alt", "data-asset-id", "data-page", "href"],
+    FORBID_TAGS: ["script", "style", "iframe", "object", "embed", "form", "svg", "math", "template"],
+  });
+}
+
+function descriptionText(source: string): string {
+  const safe = DOMPurify.sanitize(source, { ALLOWED_TAGS: ["br"], ALLOWED_ATTR: [] });
+  const holder = document.createElement("div");
+  holder.innerHTML = safe.replace(/<br\s*\/?\s*>/gi, "\n");
+  return holder.textContent?.trim() ?? "";
+}
+
+function displayDate(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toLocaleDateString("ja-JP");
+}
+
+function safePageHtml(source: string): string {
+  const holder = document.createElement("div");
+  holder.innerHTML = safeHtml(source);
+  for (const anchor of holder.querySelectorAll<HTMLAnchorElement>("a")) {
+    const page = anchor.dataset.page;
+    if (anchor.classList.contains("jump-link") && page && /^\d+$/.test(page)) {
+      anchor.setAttribute("href", "#");
+      continue;
+    }
+    const href = anchor.getAttribute("href");
+    if (!href || !/^https?:\/\//i.test(href)) anchor.removeAttribute("href");
+    anchor.removeAttribute("data-page");
+  }
+  return holder.innerHTML;
+}
+
+export function OnlineReader({ work, fontSize, lineHeight, fontFamily, readerTheme, onBack, onFontSizeChange, onLineHeightChange, backLabel = "作品一覧に戻る", onSaved, offline = false, offlineCollections, offlineAuthorCover = false, offlineEditHash = null, snapshotGeneration }: { work: PcWork; fontSize: number; lineHeight: number; fontFamily: "serif" | "sans"; readerTheme: "white" | "paper" | "night"; onBack: () => void; onFontSizeChange: (value: number) => void; onLineHeightChange: (value: number) => void; backLabel?: string; onSaved?: () => void; offline?: boolean; offlineCollections?: PcCollection[]; offlineAuthorCover?: boolean; offlineEditHash?: string | null; snapshotGeneration?: number }) {
+  const [activeEditHash, setActiveEditHash] = useState<string | null | undefined>(offline ? offlineEditHash : undefined);
+  const [pageIndex, setPageIndex] = useState(() => offline ? savedPage(work, offlineEditHash) : 0);
+  const [page, setPage] = useState<PcPage | null>(null);
+  const [html, setHtml] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [imageResolutionDone, setImageResolutionDone] = useState(false);
+  const [assetsReady, setAssetsReady] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const [retry, setRetry] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [outline, setOutline] = useState<PcOutlineEntry[]>([]);
+  const [outlineOpen, setOutlineOpen] = useState(false);
+  const [typeOpen, setTypeOpen] = useState(false);
+  const [readerTitleExpanded, setReaderTitleExpanded] = useState(false);
+  const [sidebarTitleExpanded, setSidebarTitleExpanded] = useState(false);
+  const [readerTitleOverflow, setReaderTitleOverflow] = useState(false);
+  const [sidebarTitleOverflow, setSidebarTitleOverflow] = useState(false);
+  const [detailWork, setDetailWork] = useState<PcWork | null>(null);
+  const [isEdited, setIsEdited] = useState(false);
+  const [collections, setCollections] = useState<PcCollection[] | null>(offlineCollections ?? null);
+  const [jumpPage, setJumpPage] = useState(1);
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
+  const scrollRef = useRef<HTMLElement>(null);
+  const readerTitleRef = useRef<HTMLHeadingElement>(null);
+  const sidebarTitleRef = useRef<HTMLElement>(null);
+  const pendingRestore = useRef<SavedPosition | null>(offline ? readSavedPosition(work, offlineEditHash) : null);
+  const pendingOutline = useRef<{ page: number; index: number } | null>(null);
+  const readingWork = detailWork ?? work;
+  const positionKey = activeEditHash === undefined ? null : readingKey(readingWork, activeEditHash);
+
+  const adoptRevision = (metadata: PcMetadata): boolean => {
+    if (activeEditHash !== undefined && sameRevision(metadata, readingWork, activeEditHash)) {
+      setDetailWork(metadata.work);
+      setIsEdited(metadata.isEdited);
+      return false;
+    }
+    // A different edit or source version must never inherit the prior page or outline.
+    pendingRestore.current = readSavedPosition(metadata.work, metadata.activeEditHash);
+    pendingOutline.current = null;
+    setOutline([]);
+    setDetailWork(metadata.work);
+    setIsEdited(metadata.isEdited);
+    setPageIndex(savedPage(metadata.work, metadata.activeEditHash));
+    setActiveEditHash(metadata.activeEditHash);
+    setRetry((current) => current + 1);
+    return true;
+  };
+
+  useEffect(() => {
+    if (offline) return;
+    let alive = true;
+    void getPcMetadata(work.id).then((metadata) => {
+      if (!alive) return;
+      setDetailWork(metadata.work);
+      setIsEdited(metadata.isEdited);
+      pendingRestore.current = readSavedPosition(metadata.work, metadata.activeEditHash);
+      setPageIndex(savedPage(metadata.work, metadata.activeEditHash));
+      setActiveEditHash(metadata.activeEditHash);
+    }).catch(() => {
+      if (!alive) return;
+      // 本文が取得できる場合は読書を続ける。未知の編集状態で古い位置は流用しない。
+      setActiveEditHash("unknown");
+    });
+    return () => { alive = false; };
+  }, [offline, work.id]);
+
+  const capturePosition = () => {
+    const viewport = scrollRef.current;
+    if (!viewport || loading || problem || !page) return;
+    const length = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    pendingRestore.current = {
+      page: pageIndex,
+      top: viewport.scrollTop,
+      ratio: length > 0 ? viewport.scrollTop / length : 0,
+      fontSize,
+      lineHeight,
+      fontFamily,
+    };
+  };
+
+  useEffect(() => {
+    if (!imageResolutionDone || loading || problem) return;
+    const viewport = scrollRef.current;
+    if (!viewport) return;
+    const images = [...viewport.querySelectorAll<HTMLImageElement>(".online-document img")];
+    const outlineTarget = pendingOutline.current?.page === pageIndex
+      ? viewport.querySelectorAll<HTMLElement>(".online-document h2")[pendingOutline.current.index]
+      : null;
+    const saved = pendingRestore.current?.page === pageIndex ? pendingRestore.current : null;
+    const threshold = (saved?.top ?? 0) + viewport.clientHeight;
+    // Only images before the restored reading position (or outline heading)
+    // need to settle. Later illustrations may continue loading while reading.
+    const critical = images.filter((image) => outlineTarget
+      ? Boolean(image.compareDocumentPosition(outlineTarget) & Node.DOCUMENT_POSITION_FOLLOWING)
+      : image.getBoundingClientRect().top - viewport.getBoundingClientRect().top + viewport.scrollTop <= threshold);
+    let frame = 0;
+    const settle = () => {
+      if (critical.every((image) => !image.isConnected || (!image.hasAttribute("data-asset-id") && image.complete))) {
+        cancelAnimationFrame(frame);
+        frame = requestAnimationFrame(() => setAssetsReady(true));
+      }
+    };
+    viewport.addEventListener("load", settle, true);
+    viewport.addEventListener("error", settle, true);
+    viewport.addEventListener("piep-asset-change", settle);
+    settle();
+    return () => {
+      viewport.removeEventListener("load", settle, true);
+      viewport.removeEventListener("error", settle, true);
+      viewport.removeEventListener("piep-asset-change", settle);
+      cancelAnimationFrame(frame);
+    };
+  }, [html, imageResolutionDone, loading, problem, pageIndex]);
+
+  useLayoutEffect(() => {
+    const titles = [readerTitleRef.current, sidebarTitleRef.current].filter((node): node is HTMLElement => Boolean(node));
+    const check = () => {
+      if (!readerTitleExpanded) setReaderTitleOverflow(Boolean(readerTitleRef.current && readerTitleRef.current.scrollHeight > readerTitleRef.current.clientHeight + 1));
+      if (!sidebarTitleExpanded) setSidebarTitleOverflow(Boolean(sidebarTitleRef.current && sidebarTitleRef.current.scrollHeight > sidebarTitleRef.current.clientHeight + 1));
+    };
+    check();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(check);
+    titles.forEach((node) => observer?.observe(node));
+    return () => observer?.disconnect();
+  }, [readerTitleExpanded, sidebarTitleExpanded, outlineOpen, pageIndex, fontSize, work.title]);
+
+  useEffect(() => {
+    const backWindow = window as Window & { piepAndroidReaderLayerBack?: () => boolean };
+    backWindow.piepAndroidReaderLayerBack = () => {
+      if (outlineOpen) { setOutlineOpen(false); return true; }
+      if (typeOpen) { setTypeOpen(false); return true; }
+      return false;
+    };
+    return () => { delete backWindow.piepAndroidReaderLayerBack; };
+  }, [outlineOpen, typeOpen]);
+
+  const save = async () => {
+    setSaving(true);
+    setSaveMessage(null);
+    try { await saveOfflineWork(work.id); onSaved?.(); setSaveMessage("端末に保存しました"); }
+    catch (error) { setSaveMessage(pcErrorMessage(error)); }
+    finally { setSaving(false); }
+  };
+
+  useEffect(() => {
+    if (!positionKey) return;
+    try { window.localStorage.setItem(`${positionKey}.page`, String(pageIndex)); } catch { /* storage unavailable */ }
+  }, [positionKey, pageIndex]);
+
+  useEffect(() => {
+    const viewport = scrollRef.current;
+    if (!viewport || !positionKey || loading || problem || !page || page.page !== pageIndex) return;
+    let restored = false;
+    let changed = false;
+    let timer: number | null = null;
+    let frame = 0;
+    const saved = pendingRestore.current?.page === pageIndex ? pendingRestore.current : null;
+    const flush = () => {
+      if (!changed || !restored) return;
+      changed = false;
+      const length = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+      const position: SavedPosition = {
+        page: pageIndex,
+        top: viewport.scrollTop,
+        ratio: length > 0 ? viewport.scrollTop / length : 0,
+        fontSize,
+        lineHeight,
+        fontFamily,
+      };
+      try { window.localStorage.setItem(`${positionKey}.position`, JSON.stringify(position)); } catch { /* storage unavailable */ }
+    };
+    const onScroll = () => {
+      if (!restored) return;
+      changed = true;
+      if (timer === null) timer = window.setTimeout(() => { timer = null; flush(); }, 400);
+    };
+    const onUserInput = () => {
+      if (!saved || assetsReady) return;
+      pendingRestore.current = null;
+      restored = true;
+    };
+    viewport.addEventListener("scroll", onScroll, { passive: true });
+    viewport.addEventListener("touchstart", onUserInput, { passive: true });
+    viewport.addEventListener("wheel", onUserInput, { passive: true });
+    viewport.addEventListener("pointerdown", onUserInput, { passive: true });
+    if (saved) {
+      const sameType = saved.fontSize === fontSize && saved.lineHeight === lineHeight && saved.fontFamily === fontFamily;
+      const deadline = performance.now() + 2000;
+      const restore = () => {
+        const length = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+        const target = sameType ? Math.min(saved.top, length) : saved.ratio * length;
+        viewport.scrollTop = target;
+        if (Math.abs(viewport.scrollTop - target) < 2 || performance.now() >= deadline) {
+          restored = true;
+          pendingRestore.current = null;
+        } else frame = requestAnimationFrame(restore);
+      };
+      if (assetsReady) frame = requestAnimationFrame(restore);
+    } else {
+      pendingRestore.current = null;
+      restored = true;
+    }
+    return () => {
+      viewport.removeEventListener("scroll", onScroll);
+      viewport.removeEventListener("touchstart", onUserInput);
+      viewport.removeEventListener("wheel", onUserInput);
+      viewport.removeEventListener("pointerdown", onUserInput);
+      cancelAnimationFrame(frame);
+      if (timer !== null) window.clearTimeout(timer);
+      flush();
+    };
+  }, [positionKey, pageIndex, page, html, loading, problem, assetsReady, fontSize, lineHeight, fontFamily]);
+
+  useEffect(() => {
+    const target = pendingOutline.current;
+    const viewport = scrollRef.current;
+    if (!target || !viewport || outlineOpen || loading || !assetsReady || page?.page !== target.page) return;
+    const heading = viewport.querySelectorAll<HTMLElement>(".online-document h2")[target.index];
+    pendingOutline.current = null;
+    if (!heading) return;
+    const offset = heading.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+    viewport.scrollTop += offset - 16;
+  }, [page, html, pageIndex, outlineOpen, loading, assetsReady]);
+
+  useEffect(() => {
+    if (!offline && activeEditHash === undefined) return;
+    let alive = true;
+    void (async () => {
+      try {
+        if (!offline) {
+          const before = await getPcMetadata(work.id);
+          if (!alive || adoptRevision(before)) return;
+        }
+        const entries = await (offline ? getOfflineOutline(work.id) : getPcOutline(work.id));
+        if (!alive) return;
+        if (!offline) {
+          const after = await getPcMetadata(work.id);
+          if (!alive || adoptRevision(after)) return;
+        }
+        setOutline(entries);
+      } catch { if (alive) setOutline([]); }
+    })();
+    return () => { alive = false; };
+  }, [offline, work.id, positionKey, outlineOpen]);
+
+  useEffect(() => {
+    if (!outlineOpen || offline) return;
+    let alive = true;
+    void getPcWorkCollections(work.id).then((memberships) => { if (alive) setCollections(memberships); }).catch(() => {});
+    return () => { alive = false; };
+  }, [outlineOpen, offline, work.id]);
+
+  useEffect(() => {
+    if (activeEditHash === undefined) return;
+    let cancelled = false;
+    setLoading(true);
+    setProblem(null);
+    setPage(null);
+    setHtml("");
+    setImageResolutionDone(false);
+    setAssetsReady(false);
+    void (async () => {
+      try {
+        if (!offline) {
+          const before = await getPcMetadata(work.id);
+          if (cancelled || adoptRevision(before)) return;
+        }
+        const next = await (offline ? getOfflinePage(work.id, pageIndex) : getPcPage(work.id, pageIndex));
+        if (cancelled) return;
+        if (!offline) {
+          const after = await getPcMetadata(work.id);
+          if (cancelled || adoptRevision(after)) return;
+        }
+        setPage(next);
+        setJumpPage(next.page + 1);
+        if (next.page !== pageIndex) setPageIndex(next.page);
+        const clean = safePageHtml(next.html);
+        setHtml(clean);
+        setLoading(false);
+        // Let React mount the sanitized document before filling its images.
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        if (cancelled) return;
+        const viewport = scrollRef.current;
+        const images = [...(viewport?.querySelectorAll<HTMLImageElement>(".online-document img") ?? [])];
+        setImageResolutionDone(true);
+        if (!images.length) return;
+        const uniqueIds = [...new Set(images.map((image) => Number(image.dataset.assetId)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+        for (const image of images) {
+          const id = Number(image.dataset.assetId);
+          if (Number.isSafeInteger(id) && id > 0) continue;
+          const message = document.createElement("span");
+          message.className = "reader-missing-image";
+          message.setAttribute("role", "alert");
+          message.textContent = `画像を読み込めません（${image.alt || "本文画像"}）`;
+          image.replaceWith(message);
+        }
+        let nextAsset = 0;
+        const fetchAsset = async () => {
+          while (!cancelled && nextAsset < uniqueIds.length) {
+            const assetId = uniqueIds[nextAsset++];
+            let source: string | null = null;
+            try {
+              const asset = await (offline ? getOfflineAsset(work.id, assetId) : getPcAsset(work.id, assetId));
+              source = `data:${asset.mimeType};base64,${asset.base64}`;
+            } catch { /* Show this image's failure without delaying other images. */ }
+            if (cancelled) return;
+            for (const image of viewport?.querySelectorAll<HTMLImageElement>(`.online-document img[data-asset-id="${assetId}"]`) ?? []) {
+              if (source) {
+                image.src = source;
+                image.removeAttribute("data-asset-id");
+              } else {
+                const message = document.createElement("span");
+                message.className = "reader-missing-image";
+                message.setAttribute("role", "alert");
+                message.textContent = `画像を読み込めません（${image.alt || "本文画像"}）`;
+                image.replaceWith(message);
+              }
+            }
+            viewport?.dispatchEvent(new Event("piep-asset-change"));
+          }
+        };
+        // Fill each illustration as it arrives while four requests share the LAN.
+        await Promise.all(Array.from({ length: Math.min(4, uniqueIds.length) }, fetchAsset));
+        if (cancelled) return;
+        if (!cancelled && !offline) {
+          const afterAssets = await getPcMetadata(work.id);
+          if (cancelled || adoptRevision(afterAssets)) return;
+        }
+      } catch (error) {
+        if (!cancelled) { setProblem(pcErrorMessage(error)); setLoading(false); }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [work.id, pageIndex, retry, offline, positionKey]);
+
+  const openContentLink = (event: React.MouseEvent<HTMLDivElement>) => {
+    const anchor = (event.target as HTMLElement).closest<HTMLAnchorElement>("a[href]");
+    if (!anchor || !event.currentTarget.contains(anchor)) return;
+    event.preventDefault();
+    const sourcePage = Number(anchor.dataset.page);
+    if (anchor.classList.contains("jump-link") && Number.isSafeInteger(sourcePage) && sourcePage >= 1) {
+      const target = page?.sourcePageStarts[sourcePage - 1];
+      if (target !== undefined) setPageIndex(target);
+      return;
+    }
+    const href = anchor.getAttribute("href");
+    if (href && /^https?:\/\//i.test(href)) {
+      void openUrl(href).catch(() => setSaveMessage("リンクを開けませんでした"));
+    }
+  };
+
+  const jumpTo = (index: number) => {
+    if (!page || !Number.isSafeInteger(index)) return;
+    setPageIndex(Math.min(Math.max(index, 0), page.pageCount - 1));
+    setOutlineOpen(false);
+  };
+
+  const jumpToOutline = (entry: PcOutlineEntry) => {
+    // 目次の page/index は転送後の読書ページと、そのページ内の h2 の順番。
+    pendingRestore.current = null;
+    pendingOutline.current = { page: entry.page - 1, index: entry.index };
+    setPageIndex(entry.page - 1);
+    setOutlineOpen(false);
+  };
+
+  const sidebarWork = detailWork ?? work;
+  const description = sidebarWork.excerpt ? descriptionText(sidebarWork.excerpt) : "";
+  const date = displayDate(sidebarWork.sourceCreatedAt ?? sidebarWork.downloadedAt);
+
+  const finishHorizontalSwipe = (event: React.TouchEvent<HTMLElement>) => {
+    const start = touchStart.current;
+    touchStart.current = null;
+    const viewport = scrollRef.current;
+    if (!start || !viewport || !page || loading || event.changedTouches.length !== 1) return;
+    const dx = event.changedTouches[0].clientX - start.x;
+    const dy = event.changedTouches[0].clientY - start.y;
+    if (Math.abs(dx) < 85 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+    const direction = dx < 0 ? 1 : -1;
+    const end = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    // A transfer page can contain many screens of text. A swipe advances one
+    // screen until its edge; only then does it switch transfer pages.
+    if ((direction > 0 && viewport.scrollTop < end - 2) || (direction < 0 && viewport.scrollTop > 2)) {
+      viewport.scrollBy({ top: direction * Math.max(1, viewport.clientHeight - 48), behavior: "smooth" });
+      return;
+    }
+    const next = pageIndex + direction;
+    if (next >= 0 && next < page.pageCount) setPageIndex(next);
+  };
+
+  return <div className={`reader-screen reader-theme--${readerTheme}`}>
+    <header className="reader-toolbar"><button className="text-button back-button" onClick={onBack} aria-label={backLabel}>← <span>戻る</span></button><span className="reader-toolbar-title">{work.title}</span><div className="reader-toolbar-actions"><button className="text-button" onClick={() => setOutlineOpen(true)}>{outline.length > 0 ? "目次・情報" : "作品情報"}</button><button className="text-button reader-type-button" onClick={() => setTypeOpen(true)} aria-label="文字の表示設定">文字</button></div></header>
+    {saveMessage && <div className="reader-notice" role="status">{saveMessage}</div>}
+    {typeOpen && <div className="reader-type-layer"><button className="reader-type-scrim" onClick={() => setTypeOpen(false)} aria-label="表示設定を閉じる" /><div className="reader-type-panel" role="dialog" aria-label="文字の表示設定" onClickCapture={(event) => { if ((event.target as Element).closest(".reader-type-row button")) capturePosition(); }}><div className="reader-type-heading"><strong>文字の表示</strong><button onClick={() => setTypeOpen(false)} aria-label="閉じる">×</button></div><div className="reader-type-row"><span>文字サイズ</span><div><button disabled={fontSize <= 14} onClick={() => onFontSizeChange(fontSize - 1)} aria-label="文字を小さくする">−</button><strong>{fontSize}px</strong><button disabled={fontSize >= 28} onClick={() => onFontSizeChange(fontSize + 1)} aria-label="文字を大きくする">＋</button></div></div><div className="reader-type-row"><span>行間</span><div><button disabled={lineHeight <= 1.4} onClick={() => onLineHeightChange(Math.max(1.4, Math.round((lineHeight - .1) * 100) / 100))} aria-label="行間を狭くする">−</button><strong>{lineHeight.toFixed(2)}</strong><button disabled={lineHeight >= 2.4} onClick={() => onLineHeightChange(Math.min(2.4, Math.round((lineHeight + .1) * 100) / 100))} aria-label="行間を広くする">＋</button></div></div></div></div>}
+    <main className="reader-scroll" ref={scrollRef} key={pageIndex} onTouchStart={(event) => { if (event.touches.length === 1) touchStart.current = { x: event.touches[0].clientX, y: event.touches[0].clientY }; }} onTouchEnd={finishHorizontalSwipe}><article className={`reading-paper online-paper reader-font--${fontFamily}`} style={{ fontSize: `${fontSize}px`, lineHeight }}>
+      {pageIndex === 0 && <><h1 ref={readerTitleRef} className={readerTitleExpanded ? "reader-work-title expanded" : "reader-work-title"}>{work.title}</h1>{readerTitleOverflow && <button className="reader-title-toggle" onClick={() => setReaderTitleExpanded((expanded) => !expanded)} aria-expanded={readerTitleExpanded}>{readerTitleExpanded ? "タイトルを短く表示" : "タイトルをすべて表示"}</button>}<div className="reader-rule" /></>}
+      {loading ? <p>本文を読み込んでいます…</p> : problem ? <div className="reader-error" role="alert"><p>{problem}</p><button onClick={() => setRetry((current) => current + 1)}>もう一度読み込む</button></div> : <div className="online-document" onClick={openContentLink} dangerouslySetInnerHTML={{ __html: html }} />}
+    </article></main>
+    {page && page.pageCount > 1 && <footer className="reader-footer"><button onClick={() => setPageIndex((current) => Math.max(0, current - 1))} disabled={loading || pageIndex === 0}>前のページ</button><span aria-live="polite">{`${page.page + 1} / ${page.pageCount}`}</span><button onClick={() => setPageIndex((current) => current + 1)} disabled={loading || pageIndex >= page.pageCount - 1}>次のページ</button></footer>}
+    {outlineOpen && <div className="reader-outline-layer">
+      <button className="reader-outline-scrim" onClick={() => setOutlineOpen(false)} aria-label="目次と情報を閉じる" />
+      <aside className="reader-outline" aria-label="目次と作品情報">
+        <div className="reader-outline-heading"><h2>{outline.length > 0 ? "目次・作品情報" : "作品情報"}</h2><button onClick={() => setOutlineOpen(false)} aria-label="閉じる">×</button></div>
+        <div className="reader-outline-work"><span className="reader-outline-cover"><WorkThumbnail work={sidebarWork} offline={offline} snapshotGeneration={snapshotGeneration} /></span><div className="reader-outline-work-text"><div className="reader-outline-labels"><ProviderMark source={sidebarWork.source} compact /><span>{sidebarWork.contentType === "novel" ? "小説" : "作品"}</span>{isEdited && <span>編集版</span>}</div><strong ref={sidebarTitleRef} className={sidebarTitleExpanded ? "expanded" : ""}>{sidebarWork.title}</strong>{sidebarTitleOverflow && <button className="reader-outline-title-toggle" onClick={() => setSidebarTitleExpanded((expanded) => !expanded)} aria-expanded={sidebarTitleExpanded}>{sidebarTitleExpanded ? "タイトルを短く表示" : "タイトルをすべて表示"}</button>}<span className="reader-outline-author"><AuthorAvatar work={sidebarWork} offline={offline} offlineAuthorCover={offlineAuthorCover} snapshotGeneration={snapshotGeneration} />{sidebarWork.authorName}</span>{sidebarWork.seriesTitle && <small>{sidebarWork.seriesTitle}</small>}</div></div>
+        {!offline && <button className="reader-outline-save" disabled={saving} onClick={() => void save()}>{saving ? "保存中…" : "端末に保存"}</button>}
+        {saveMessage && <p className="reader-outline-save-status" role="status">{saveMessage}</p>}
+        {page && page.pageCount > 1 && <div className="reader-outline-progress"><div><span>{page.page + 1} / {page.pageCount} ページ</span><span>{Math.round((page.page + 1) / page.pageCount * 100)}%</span></div><progress max={100} value={(page.page + 1) / page.pageCount * 100} aria-label="ページ位置" /></div>}
+        {page && page.pageCount > 1 && <div className="reader-jump" aria-label="ページ移動"><div className="reader-jump-heading"><strong>ページを移動</strong><span>{jumpPage} / {page.pageCount}</span></div><input type="range" min="1" max={page.pageCount} step="1" value={jumpPage} aria-label="移動先のページ" onChange={(event) => setJumpPage(Number(event.target.value))} /><div className="reader-jump-actions"><button type="button" disabled={page.page === 0} onClick={() => jumpTo(page.page - 1)}>前のページ</button><button type="button" className="reader-jump-go" disabled={jumpPage === page.page + 1} onClick={() => jumpTo(jumpPage - 1)}>選んだページを開く</button><button type="button" disabled={page.page >= page.pageCount - 1} onClick={() => jumpTo(page.page + 1)}>次のページ</button></div></div>}
+        {outline.length > 0 && <div className="reader-outline-list"><h3>見出し</h3>{outline.map((entry) => <button key={`${entry.page}:${entry.index}`} onClick={() => jumpToOutline(entry)}><strong>{entry.title}</strong><small>{entry.page} ページ</small></button>)}</div>}
+        <section className="reader-outline-details" aria-label="作品情報"><div className="reader-outline-facts">{date && <span>公開 {date}</span>}<span>{sidebarWork.textLength.toLocaleString("ja-JP")} 字</span><span>{sidebarWork.assetCount.toLocaleString("ja-JP")} 画像</span>{sidebarWork.favorite && <span>お気に入り</span>}</div>{description && <p className="reader-outline-description">{description}</p>}{sidebarWork.tags.length > 0 && <div className="reader-outline-tags" aria-label="タグ">{sidebarWork.tags.map((tag, index) => <span key={`${tag}:${index}`}>#{tag}</span>)}</div>}{collections && collections.length > 0 && <div className="reader-outline-collections"><strong>コレクション</strong>{collections.map((collection) => <span key={collection.id}>{collection.name}</span>)}</div>}</section>
+      </aside>
+    </div>}
+  </div>;
+}
