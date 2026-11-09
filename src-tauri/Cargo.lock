@@ -2852,14 +2852,26 @@ dependencies = [
 name = "piep-android-storage"
 version = "0.1.0"
 dependencies = [
+ "piep-library-protocol",
  "piep-storage",
+ "uuid",
+]
+
+[[package]]
+name = "piep-library-protocol"
+version = "0.1.0"
+source = "git+https://github.com/1211snowmaple/piep.git?rev=eb9f0d6265808bb48722c83668ce7b33103e222b#eb9f0d6265808bb48722c83668ce7b33103e222b"
+dependencies = [
+ "piep-storage",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
 [[package]]
 name = "piep-storage"
 version = "0.1.0"
-source = "git+https://github.com/1211snowmaple/piep.git?rev=6921a1e17cb0f6da38cc0ab9b49ab2e37645fb57#6921a1e17cb0f6da38cc0ab9b49ab2e37645fb57"
+source = "git+https://github.com/1211snowmaple/piep.git?rev=eb9f0d6265808bb48722c83668ce7b33103e222b#eb9f0d6265808bb48722c83668ce7b33103e222b"
 dependencies = [
  "libc",
  "serde",

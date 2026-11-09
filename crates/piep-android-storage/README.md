@@ -18,6 +18,12 @@
 トランザクションで切り替える。ネットワーク取得、認証鍵、Kotlin の実行制御も別の責務。
 並行する削除・GC は未接続であり、この参照を永続 pin の代わりには使わない。
 
+`TransferExpectation` は通信開始時の名前空間・要求対象・転送記録のハッシュを固定する。
+`prepare_transfer` は同じ revision の共通 protocol で応答を検査し、別の接続・棚・利用者・
+対象や異なる元バイト列の記録を拒否する。`PreparedTransfer` は未取得の部分を照合して受信し、
+全 file の検証後には要求対象も保持した `VerifiedTransferFile` を返す。
+接続の現在世代・認証・bundle の切り替えは repository で別途確認する必要がある。
+
 現在のアプリはこの crate を native dependency に持つが、旧保存物の移行や API v2、
 端末 DB・読書画面からはまだ呼び出さない。本番の保存先や既存の読書を変更しない。
 

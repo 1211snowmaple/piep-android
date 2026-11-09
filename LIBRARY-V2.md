@@ -259,7 +259,13 @@ URL や整数 ID だけから新しい library/work/snapshot UUID を作らな�
 領域を分ける。受信途中の再開、検証済み file の読み出し、異なる名前空間の隔離を実装した。
 Android で hard link の許可を前提にせず、既存実体を置き換えない原子的な rename で公開する。
 アプリの native dependency には接続したが、現行 offline の保存先・起動処理は切り替えていない。
-これは wire DTO、API v2、bundle の DB 確定や GC の完成を意味しない。
+これは API v2、bundle の DB 確定や GC の完成を意味しない。
+
+一ファイル用の `piep-resource-transfer-v1` を共通 protocol crate から利用する。
+`TransferExpectation` で要求開始時の名前空間・資産・元記録のハッシュを固定し、
+`PreparedTransfer` で対象・形式・順番・長さを照合して受信する。検証済み file の結果も
+要求対象を保持する。これは API v2 や読書 bundle の DTO 全体を実装したという意味ではない。
+デスクトップ側の [構成の図解](https://github.com/1211snowmaple/piep/blob/codex/library-data-v2/docs/plan/library-architecture-guide.md) も参照。
 
 1. Tauri に依存しない実体形式・wire DTO の共有と試験ベクトル。Android 向けコンパイルも検証する。
 2. API v2 の身元・対応版・所属照合と、固定した bundle の配信。旧 API はそのまま扱う。

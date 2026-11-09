@@ -7,5 +7,6 @@ publish = false
 description = "Namespace-scoped native storage for the Android library"
 
 [dependencies]
-piep-storage = { git = "https://github.com/1211snowmaple/piep.git", rev = "6921a1e17cb0f6da38cc0ab9b49ab2e37645fb57" }
+piep-storage = { git = "https://github.com/1211snowmaple/piep.git", rev = "eb9f0d6265808bb48722c83668ce7b33103e222b" }
+piep-library-protocol = { git = "https://github.com/1211snowmaple/piep.git", rev = "eb9f0d6265808bb48722c83668ce7b33103e222b" }
 uuid = { version = "1", features = ["v4"] }

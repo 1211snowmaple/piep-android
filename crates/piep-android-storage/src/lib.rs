@@ -1,6 +1,10 @@
 //! 接続・棚・利用者を固定する端末保管。Tauri・WebView・端末 DB から独立する。
 //! 接続の認可・epoch・bundle の公開は呼び手の責務で、この層は完成を記録しない。
 
+mod transfer;
+pub use piep_library_protocol as protocol;
+pub use transfer::{PreparedTransfer, TransferExpectation, VerifiedTransferFile};
+
 pub use piep_storage::{ContentFile, Error, FileChunk, Fingerprint, Result};
 use piep_storage::{ObjectStore, regular_directory, sync_directory};
 use std::{
