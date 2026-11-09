@@ -72,12 +72,14 @@ Android に `src-tauri/src/library` を丸ごとコピーしない。別リポ�
 | 検索・詳細 | 作品 UUID と確認時点の snapshot/edit を返す。検索 cursor は棚・条件・規則の版に固定する |
 | 読書マニフェスト | 作品と snapshot/edit を明示して、本文・資産・対応表・表示物とその完全性情報を返す |
 | 実体取得 | `/libraries/{l}/works/{w}/{snapshots|edits}/{scope}/files/{fileHash}/chunks/{chunkHash}` のように所属を指定する |
-| 利用者操作 | 要求 UUID、対象の保存状態、期待する syncEpoch と更新世代、変更内容を送る。保存結果・更新世代・完了記録を返す |
+| 利用者操作 | 要求 UUID、対象、期待する syncEpoch と利用者状態の更新世代、変更内容を送る。保存結果・更新世代・完了記録を返す |
 | 変更取得 | 利用者と棚に限定した不透明 cursor から変更と完了記録を読む。epoch 不一致は再照合を要求する |
 
 UUID は文字列、SHA-256 は小文字の 64 桁 16 進とする。世代・通算量等の 64 bit 値は
 10 進文字列で渡し、JavaScript の `number` への丸めを避ける。
 内部 Rust 型の serde 出力をそのまま HTTP の恒久契約にはせず、境界で検査・変換する。
+お気に入りは作品 UUID を対象にし、位置は snapshot/edit も必要とする。利用者状態の世代と
+取得元の現在版の世代は混同せず、作者の改稿だけでお気に入りの未送信操作を無効にしない。
 
 実体のハッシュ自体は権限ではない。サーバーは利用者、棚、作品、snapshot/edit、file、chunk の
 所属を順に照合し、認証後に ETag / 304 を判定する。別作品の実体や現在版の資産で代用しない。
@@ -125,6 +127,23 @@ raw/Zstandard はデスクトップの保管形式 v1 を共用する。
 | readings / operation_outbox / receipts | 端末の読書位置・未送信操作・同じ要求の完了記録 |
 | sync_cursors | 棚・利用者・epoch ごとの取得済み位置 |
 | 派生索引・キャッシュ台帳 | 保存版に固定した全文索引、表示画像、空き容量と回収対象 |
+
+識別と制約は次を必須にする。
+
+- namespace は接続登録・library・subject の組に UNIQUE を置く。作品と同期状態の FK に namespace を含める。
+- bundle ID は認証情報を含まない不変 manifest の元バイト列の SHA-256 とする。URL・秘密・接続世代・
+  取得の都度変わる日時をその manifest へ入れず、通信の文脈として別に扱う。
+- `bundle_files` は `(namespace, bundle, resource)` を一意にし、bundle と同じ namespace の file を FK で結ぶ。
+  `file_chunks` は `(namespace, file, sequence)` を一意にし、同じ namespace の chunk を参照する。
+  順番・offset・長さの整合と全 file の検証を、公開前に照合する。
+- `offline_current` は `(namespace, work, viewKind)` を一意にし、同じ作品の完了済み bundle だけを
+  複合 FK で参照する。未完成の bundle や別作品の bundle へ指せないようにする。
+- outbox の操作 UUID は namespace 内で一意にする。操作の内容を途中で変えず、同じ UUID の別内容を拒否する。
+  cursor は namespace・利用者・syncEpoch に所属させる。
+- 同期する読書状態の世代は作品と利用者に属する。版別の端末内履歴を持つ場合も、別のサーバー状態として
+  勝手に増やさない。位置の削除後も更新世代を保持する。
+- DB は全接続で FK を有効にし、既知の schema・検査記録を照合してから前方移行する。
+  更新は transaction とし、未知の版を自動初期化しない。
 
 manifest の対象を決め、実体を一時領域へ受信し、検証して不変実体を公開する。
 必要な全 file が復元可能になってから、bundle の完了・`offline_current`・転送完了を
