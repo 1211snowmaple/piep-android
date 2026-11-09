@@ -34,6 +34,7 @@ dist-ssr
 *.key
 
 # Build output and tool caches.
+target/
 *.apk
 *.aab
 **/.kotlin/

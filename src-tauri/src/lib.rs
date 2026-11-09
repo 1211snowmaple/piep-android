@@ -2,6 +2,9 @@ mod app_update;
 mod pc_client;
 mod secret_cipher;
 
+// 新ライブラリの保管境界。旧 offline の保存先や起動処理はここでは切り替えない。
+pub use piep_android_storage as library_storage;
+
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
