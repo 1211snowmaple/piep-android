@@ -1,0 +1,11 @@
+[package]
+name = "piep-android-storage"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "Namespace-scoped native storage for the Android library"
+
+[dependencies]
+piep-storage = { git = "https://github.com/1211snowmaple/piep.git", rev = "6921a1e17cb0f6da38cc0ab9b49ab2e37645fb57" }
+uuid = { version = "1", features = ["v4"] }
