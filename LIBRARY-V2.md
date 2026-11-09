@@ -71,7 +71,7 @@ Android に `src-tauri/src/library` を丸ごとコピーしない。別リポ�
 | 接続確認 | 対応 API・reader・実体形式、libraryId、subjectId、syncEpoch、上限・対応機能を認証後に確認する |
 | 検索・詳細 | 作品 UUID と確認時点の snapshot/edit を返す。検索 cursor は棚・条件・規則の版に固定する |
 | 読書マニフェスト | 作品と snapshot/edit を明示して、本文・資産・対応表・表示物とその完全性情報を返す |
-| 実体取得 | `/libraries/{l}/works/{w}/{snapshots|edits}/{scope}/files/{fileHash}/chunks/{chunkHash}` のように所属を指定する |
+| 実体取得 | `/libraries/{l}/works/{w}/snapshots/{scope}/files/{fileHash}/chunks/{chunkHash}` のように所属を指定する。編集では `snapshots` を `edits` にする |
 | 利用者操作 | 要求 UUID、対象、期待する syncEpoch と利用者状態の更新世代、変更内容を送る。保存結果・更新世代・完了記録を返す |
 | 変更取得 | 利用者と棚に限定した不透明 cursor から変更と完了記録を読む。epoch 不一致は再照合を要求する |
 
